@@ -34,6 +34,12 @@ Let op:
 
 Dit project is bedoeld voor een MCP-capabele agent, bijvoorbeeld een desktop-agent of editor-integratie die stdio-MCP ondersteunt.
 
+Belangrijk:
+
+- deze repository exposeert op dit moment een `stdio` MCP-server
+- voor remote gebruik over Tailscale is de veiligste route meestal `ssh` over je tailnet
+- een directe remote MCP-URL is pas logisch als je later ook een HTTP-transport toevoegt
+
 ### Stappen
 
 1. Clone de repository.
@@ -267,6 +273,119 @@ npm run start
 ```
 
 De server exposeert een tool `search_gaspedaal`.
+
+Let op:
+
+- dit proces blijft op de voorgrond draaien; dat is normaal voor een `stdio` MCP-server
+- normaal start je agent dit proces zelf en hoef je het niet handmatig los te laten draaien
+
+## Veilig Verbinden Via Tailscale En OpenClaw
+
+De huidige setup is `stdio`-only. Dat betekent dat OpenClaw deze MCP-server niet het best via een open netwerkpoort benadert, maar door lokaal een `ssh`-proces te starten dat via Tailscale naar de andere machine gaat.
+
+Aanbevolen route:
+
+```text
+OpenClaw host (100.80.102.47)
+  -> ssh over Tailscale
+MCP host (100.86.139.102)
+  -> node dist/index.js
+```
+
+Voordelen van deze aanpak:
+
+- je hoeft geen extra HTTP-poort voor MCP open te zetten
+- alle MCP-communicatie blijft binnen je tailnet
+- je kunt gewone SSH-sleutels en Tailscale ACLs gebruiken
+- dit sluit goed aan op hoe deze server nu al gebouwd is
+
+### Voorwaarden
+
+Op de MCP-host:
+
+- `npm ci` of `npm install` is al uitgevoerd
+- `npm run build` is uitgevoerd
+- Edge of Chrome is geinstalleerd
+- de machine heeft een desktop/browser-sessie als je echte zoekopdrachten wilt uitvoeren
+
+Tussen beide machines:
+
+- beide machines zitten in dezelfde tailnet
+- `tailscale ping 100.86.139.102` werkt vanaf de OpenClaw-host
+- SSH werkt vanaf de OpenClaw-host naar de MCP-host
+
+### Stap 1: test SSH over Tailscale
+
+Test eerst of je vanaf de OpenClaw-machine de MCP-server op afstand kunt starten:
+
+```bash
+ssh gaspedaal@100.86.139.102 "cd /opt/gaspedaal-mcp && /usr/bin/node dist/index.js"
+```
+
+Let op:
+
+- dit commando blijft openstaan; dat is normaal voor `stdio` MCP
+- als SSH niet werkt, zal OpenClaw later ook niet kunnen verbinden
+
+### Stap 2: registreer de server in OpenClaw
+
+Voor OpenClaw is dit nog steeds een `stdio`-server, alleen loopt de stdio-verbinding via `ssh`.
+
+Voorbeeld:
+
+```bash
+openclaw mcp set gaspedaal '{
+  "command": "ssh",
+  "args": [
+    "-o",
+    "BatchMode=yes",
+    "gaspedaal@100.86.139.102",
+    "cd /opt/gaspedaal-mcp && /usr/bin/node dist/index.js"
+  ]
+}'
+```
+
+Controleer daarna:
+
+```bash
+openclaw mcp show gaspedaal --json
+```
+
+Je kunt hiervoor ook MagicDNS gebruiken in plaats van een Tailnet IP, zolang naamresolutie in jouw tailnet goed werkt.
+
+### Voorbeeldconfiguratie
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "gaspedaal": {
+        "command": "ssh",
+        "args": [
+          "-o",
+          "BatchMode=yes",
+          "gaspedaal@100.86.139.102",
+          "cd /opt/gaspedaal-mcp && /usr/bin/node dist/index.js"
+        ]
+      }
+    }
+  }
+}
+```
+
+### Veiligheidsadvies
+
+- gebruik SSH keys, niet een interactief wachtwoord
+- beperk toegang met Tailscale ACLs zodat alleen je OpenClaw-machine de MCP-host mag bereiken
+- gebruik bij voorkeur Tailscale tags voor servermachines, niet voor laptops of user-devices
+- expose deze MCP-server niet publiek naar internet
+- als je later een HTTP MCP-transport toevoegt, gebruik dan bij voorkeur Tailscale Serve in plaats van een publieke Funnel
+
+### Wanneer je wel een remote MCP-URL zou gebruiken
+
+OpenClaw ondersteunt ook remote MCP-verbindingen via `HTTP`, `SSE` en `streamable-http`, maar deze repository levert dat transport nu nog niet mee.
+
+Wil je later een echte URL zoals `https://...` of een private Tailscale-served endpoint gebruiken, dan moet je eerst een extra HTTP-entrypoint aan deze code toevoegen.
 
 ## Ondersteunde Input Velden
 

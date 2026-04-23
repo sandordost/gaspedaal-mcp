@@ -89,7 +89,436 @@ interface ComboboxMatchOptions {
   numericTokenIndex?: number;
 }
 
+interface NormalizedGaspedaalSearchOptions {
+  query: string | null;
+  make: string | null;
+  model: string | null;
+  yearMin: string | null;
+  yearMax: string | null;
+  fuelType: string | null;
+  priceMin: string | null;
+  priceMax: string | null;
+  mileageMin: string | null;
+  mileageMax: string | null;
+  bodyType: string | null;
+  postcode: string | null;
+  radius: string | null;
+  powerMin: string | null;
+  powerMax: string | null;
+  slowMoMs: number;
+  actionDelayMs: number;
+  startUrl: string;
+  timeoutMs: number;
+}
+
+interface ReusableBrowserSession extends BrowserLaunchResult {
+  slowMoMs: number;
+}
+
+export interface PersistentGaspedaalSearchExecutorOptions {
+  userDataDir?: string;
+  slowMoMs?: number;
+  idleTimeoutMs?: number;
+}
+
+export interface GaspedaalSearchExecutor {
+  search(options: GaspedaalSearchOptions): Promise<GaspedaalSearchResult>;
+  close(): Promise<void>;
+}
+
 export async function searchGaspedaal(options: GaspedaalSearchOptions): Promise<GaspedaalSearchResult> {
+  const normalizedOptions = normalizeSearchOptions(options);
+  const userDataDir = getDefaultUserDataDir();
+  const { browser, context } = await launchRealBrowser(userDataDir, normalizedOptions.slowMoMs);
+  const page = await getOrCreateSearchPage(context);
+
+  try {
+    return await runGaspedaalSearch(page, browser, normalizedOptions);
+  } finally {
+    await context.close();
+  }
+}
+
+export function createPersistentGaspedaalSearchExecutor(
+  options: PersistentGaspedaalSearchExecutorOptions = {}
+): GaspedaalSearchExecutor {
+  const userDataDir = options.userDataDir ?? getDefaultUserDataDir();
+  const idleTimeoutMs = options.idleTimeoutMs ?? 120_000;
+  let activeSession: ReusableBrowserSession | null = null;
+  let idleCloseTimer: NodeJS.Timeout | null = null;
+  let queueTail: Promise<void> = Promise.resolve();
+
+  const clearIdleCloseTimer = (): void => {
+    if (idleCloseTimer) {
+      clearTimeout(idleCloseTimer);
+      idleCloseTimer = null;
+    }
+  };
+
+  const closeSession = async (): Promise<void> => {
+    clearIdleCloseTimer();
+
+    if (!activeSession) {
+      return;
+    }
+
+    const sessionToClose = activeSession;
+    activeSession = null;
+    await sessionToClose.context.close().catch(() => undefined);
+  };
+
+  const runExclusive = async <T>(work: () => Promise<T>): Promise<T> => {
+    const previousTail = queueTail;
+    let releaseQueue!: () => void;
+    queueTail = new Promise<void>((resolve) => {
+      releaseQueue = resolve;
+    });
+
+    await previousTail.catch(() => undefined);
+
+    try {
+      return await work();
+    } finally {
+      releaseQueue();
+    }
+  };
+
+  const scheduleIdleClose = (): void => {
+    clearIdleCloseTimer();
+
+    if (idleTimeoutMs <= 0) {
+      return;
+    }
+
+    idleCloseTimer = setTimeout(() => {
+      void runExclusive(async () => {
+        await closeSession();
+      });
+    }, idleTimeoutMs);
+
+    idleCloseTimer.unref?.();
+  };
+
+  const ensureSession = async (slowMoMs: number): Promise<ReusableBrowserSession> => {
+    if (activeSession && activeSession.slowMoMs !== slowMoMs) {
+      await closeSession();
+    }
+
+    if (activeSession) {
+      return activeSession;
+    }
+
+    const launchedSession = await launchRealBrowser(userDataDir, slowMoMs);
+    const reusableSession: ReusableBrowserSession = {
+      ...launchedSession,
+      slowMoMs
+    };
+
+    reusableSession.context.on("close", () => {
+      if (activeSession?.context === reusableSession.context) {
+        activeSession = null;
+      }
+    });
+
+    activeSession = reusableSession;
+    return reusableSession;
+  };
+
+  return {
+    search(searchOptions) {
+      return runExclusive(async () => {
+        const normalizedOptions = normalizeSearchOptions(searchOptions);
+        clearIdleCloseTimer();
+
+        const session = await ensureSession(options.slowMoMs ?? normalizedOptions.slowMoMs);
+        const page = await getOrCreateSearchPage(session.context);
+
+        try {
+          return await runGaspedaalSearch(page, session.browser, normalizedOptions);
+        } finally {
+          scheduleIdleClose();
+        }
+      });
+    },
+    close() {
+      return runExclusive(async () => {
+        await closeSession();
+      });
+    }
+  };
+}
+
+async function runGaspedaalSearch(
+  page: Page,
+  browser: string,
+  options: NormalizedGaspedaalSearchOptions
+): Promise<GaspedaalSearchResult> {
+  const query = normalizeInput(options.query);
+  const make = normalizeInput(options.make);
+  const model = normalizeInput(options.model);
+  const yearMin = normalizeInput(options.yearMin);
+  const yearMax = normalizeInput(options.yearMax);
+  const fuelType = normalizeInput(options.fuelType);
+  const priceMin = normalizeInput(options.priceMin);
+  const priceMax = normalizeInput(options.priceMax);
+  const mileageMin = normalizeInput(options.mileageMin);
+  const mileageMax = normalizeInput(options.mileageMax);
+  const bodyType = normalizeInput(options.bodyType);
+  const postcode = normalizeInput(options.postcode);
+  const radius = normalizeInput(options.radius);
+  const powerMin = normalizeInput(options.powerMin);
+  const powerMax = normalizeInput(options.powerMax);
+  const actionDelayMs = options.actionDelayMs;
+  const startUrl = options.startUrl;
+  const timeoutMs = options.timeoutMs;
+  let appliedQuery: string | null = null;
+  let appliedMake: string | null = null;
+  let appliedModel: string | null = null;
+  let advancedFiltersExpanded = false;
+
+  await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+  await dismissBlockingUi(page);
+  const searchForm = await findVisibleLocator(
+    [page.locator("#searchForm"), page.locator('[data-testid="searchbox"] form')],
+    4_000
+  );
+
+  if (!searchForm) {
+    throw new Error("Kon het Gaspedaal zoekformulier niet vinden.");
+  }
+
+  const beforeUrl = page.url();
+
+  if (query) {
+    const searchInput = await findVisibleLocator(
+      [
+        searchForm.getByPlaceholder(/Zoek op trefwoord/i),
+        searchForm.getByRole("textbox", { name: /zoek/i }),
+        searchForm.locator('input[placeholder*="Zoek"]'),
+        searchForm.locator('input[type="search"]'),
+        searchForm.locator("#trefw"),
+        searchForm.locator("input")
+      ],
+      4_000
+    );
+
+    if (!searchInput) {
+      throw new Error("Kon het Gaspedaal zoekveld niet vinden.");
+    }
+
+    await searchInput.click();
+    await searchInput.fill(query);
+    await pauseBetweenActions(page, actionDelayMs);
+    appliedQuery = normalizeInput(await searchInput.inputValue());
+  }
+
+  if (make) {
+    appliedMake = await selectComboboxValue(
+      page,
+      searchForm.locator('[data-testid="merk-dropdown"]').first(),
+      make,
+      "merk",
+      actionDelayMs
+    );
+  }
+
+  if (model) {
+    const modelInput = searchForm.locator('[data-testid="model-dropdown"]').first();
+    await waitForLocatorEnabled(modelInput, 5_000);
+    appliedModel = await selectComboboxValue(page, modelInput, model, "model", actionDelayMs);
+  }
+
+  if (yearMin) {
+    await selectComboboxValue(
+      page,
+      searchForm.locator('[data-testid="bmin-dropdown"]').first(),
+      yearMin,
+      "bouwjaar min",
+      actionDelayMs,
+      { numericTokenIndex: 0 }
+    );
+  }
+
+  if (yearMax) {
+    await selectComboboxValue(
+      page,
+      searchForm.locator('[data-testid="bmax-dropdown"]').first(),
+      yearMax,
+      "bouwjaar max",
+      actionDelayMs,
+      { numericTokenIndex: 0 }
+    );
+  }
+
+  if (fuelType) {
+    await selectComboboxValue(
+      page,
+      searchForm.locator('[data-testid="brnst-dropdown"]').first(),
+      fuelType,
+      "brandstof",
+      actionDelayMs,
+      { aliases: getFuelTypeAliases(fuelType) }
+    );
+  }
+
+  if (priceMin) {
+    await selectComboboxValue(
+      page,
+      searchForm.locator('[data-testid="pmin-dropdown"]').first(),
+      priceMin,
+      "prijs min",
+      actionDelayMs,
+      { numericTokenIndex: 0 }
+    );
+  }
+
+  if (priceMax) {
+    await selectComboboxValue(
+      page,
+      searchForm.locator('[data-testid="pmax-dropdown"]').first(),
+      priceMax,
+      "prijs max",
+      actionDelayMs,
+      { numericTokenIndex: 0 }
+    );
+  }
+
+  if (mileageMin) {
+    await selectComboboxValue(
+      page,
+      searchForm.locator('[data-testid="kmin-dropdown"]').first(),
+      mileageMin,
+      "kilometerstand min",
+      actionDelayMs,
+      { numericTokenIndex: 0 }
+    );
+  }
+
+  if (mileageMax) {
+    await selectComboboxValue(
+      page,
+      searchForm.locator('[data-testid="kmax-dropdown"]').first(),
+      mileageMax,
+      "kilometerstand max",
+      actionDelayMs,
+      { numericTokenIndex: 0 }
+    );
+  }
+
+  if (bodyType) {
+    const bodyTypeInput = searchForm.locator('[data-testid="crs-dropdown"]').first();
+
+    if (!(await bodyTypeInput.isVisible().catch(() => false))) {
+      await ensureAdvancedFiltersExpanded(page, searchForm, actionDelayMs);
+      advancedFiltersExpanded = true;
+    }
+
+    await selectComboboxValue(
+      page,
+      bodyTypeInput,
+      bodyType,
+      "carrosserie",
+      actionDelayMs,
+      {
+        aliases: getBodyTypeAliases(bodyType)
+      }
+    );
+  }
+
+  if (postcode || radius || powerMin || powerMax) {
+    await ensureAdvancedFiltersExpanded(page, searchForm, actionDelayMs);
+    advancedFiltersExpanded = true;
+  }
+
+  if (postcode) {
+    const postcodeInput = searchForm.locator('#pc-id, input[name="pc"]').first();
+    await postcodeInput.scrollIntoViewIfNeeded();
+    await postcodeInput.fill(postcode);
+    await pauseBetweenActions(page, actionDelayMs);
+  }
+
+  if (radius) {
+    const radiusInput = searchForm.locator('[data-testid="strl-dropdown"]').first();
+    await waitForLocatorEnabled(radiusInput, 5_000);
+    await selectComboboxValue(page, radiusInput, radius, "straal", actionDelayMs, {
+      numericTokenIndex: 0
+    });
+  }
+
+  if (powerMin) {
+    await selectComboboxValue(
+      page,
+      searchForm.locator('[data-testid="vmin-dropdown"]').first(),
+      powerMin,
+      "vermogen min",
+      actionDelayMs,
+      { numericTokenIndex: getPowerNumericTokenIndex(powerMin) }
+    );
+  }
+
+  if (powerMax) {
+    await selectComboboxValue(
+      page,
+      searchForm.locator('[data-testid="vmax-dropdown"]').first(),
+      powerMax,
+      "vermogen max",
+      actionDelayMs,
+      { numericTokenIndex: getPowerNumericTokenIndex(powerMax) }
+    );
+  }
+
+  const searchButton = await findVisibleLocator(
+    [
+      searchForm.getByRole("button", { name: /vinden|zoek/i }),
+      searchForm.locator('button[type="submit"]'),
+      searchForm.locator('input[type="submit"]')
+    ],
+    2_500
+  );
+
+  if (searchButton) {
+    await dismissBlockingUi(page);
+    if (advancedFiltersExpanded) {
+      await pauseBetweenActions(page, actionDelayMs);
+    }
+    await searchButton.scrollIntoViewIfNeeded();
+    await searchButton.click();
+  } else {
+    if (!query) {
+      throw new Error("Kon de knop om de zoekopdracht uit te voeren niet vinden.");
+    }
+
+    const searchInput = searchForm.locator('#trefw, input[name="trefw"]').first();
+    await searchInput.press("Enter");
+  }
+
+  await waitForSearchResults(page, beforeUrl, [query, make, model].filter((value): value is string => Boolean(value)));
+  const bodyText = normalizeWhitespace(await page.locator("body").innerText());
+  const listings = await extractListings(page);
+  const resultCountText = extractResultCountText(bodyText);
+  const totalMatches = parseDutchInteger(resultCountText);
+
+  return {
+    requestedQuery: query,
+    requestedMake: make,
+    requestedModel: model,
+    appliedQuery,
+    appliedMake,
+    appliedModel,
+    browser,
+    startUrl,
+    finalUrl: page.url(),
+    pageTitle: await page.title(),
+    searchTriggered:
+      page.url() !== beforeUrl || (query ? bodyText.toLowerCase().includes(query.toLowerCase()) : listings.length > 0),
+    resultCountText,
+    totalMatches,
+    pageListingCount: listings.length,
+    listings
+  };
+}
+
+function normalizeSearchOptions(options: GaspedaalSearchOptions): NormalizedGaspedaalSearchOptions {
   const query = normalizeInput(options.query);
   const make = normalizeInput(options.make);
   const model = normalizeInput(options.model);
@@ -120,260 +549,42 @@ export async function searchGaspedaal(options: GaspedaalSearchOptions): Promise<
     throw new Error("Een straalfilter vereist ook een postcode.");
   }
 
-  const startUrl = options.startUrl ?? GASPEDAAL_SEARCH_URL;
-  const timeoutMs = options.timeoutMs ?? 45_000;
-  const userDataDir = path.resolve(process.cwd(), ".playwright", "gaspedaal-profile");
-  const { browser, context } = await launchRealBrowser(userDataDir, slowMoMs);
-  const page = context.pages()[0] ?? (await context.newPage());
-  let appliedQuery: string | null = null;
-  let appliedMake: string | null = null;
-  let appliedModel: string | null = null;
-  let advancedFiltersExpanded = false;
+  return {
+    query,
+    make,
+    model,
+    yearMin,
+    yearMax,
+    fuelType,
+    priceMin,
+    priceMax,
+    mileageMin,
+    mileageMax,
+    bodyType,
+    postcode,
+    radius,
+    powerMin,
+    powerMax,
+    slowMoMs,
+    actionDelayMs,
+    startUrl: options.startUrl ?? GASPEDAAL_SEARCH_URL,
+    timeoutMs: options.timeoutMs ?? 45_000
+  };
+}
 
-  try {
-    await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
-    await dismissBlockingUi(page);
-    const searchForm = await findVisibleLocator(
-      [page.locator("#searchForm"), page.locator('[data-testid="searchbox"] form')],
-      4_000
-    );
+function getDefaultUserDataDir(): string {
+  return path.resolve(process.cwd(), ".playwright", "gaspedaal-profile");
+}
 
-    if (!searchForm) {
-      throw new Error("Kon het Gaspedaal zoekformulier niet vinden.");
-    }
+async function getOrCreateSearchPage(context: BrowserContext): Promise<Page> {
+  const openPages = context.pages().filter((page) => !page.isClosed());
+  const activePage = openPages[0] ?? (await context.newPage());
 
-    const beforeUrl = page.url();
-
-    if (query) {
-      const searchInput = await findVisibleLocator(
-        [
-          searchForm.getByPlaceholder(/Zoek op trefwoord/i),
-          searchForm.getByRole("textbox", { name: /zoek/i }),
-          searchForm.locator('input[placeholder*="Zoek"]'),
-          searchForm.locator('input[type="search"]'),
-          searchForm.locator("#trefw"),
-          searchForm.locator("input")
-        ],
-        4_000
-      );
-
-      if (!searchInput) {
-        throw new Error("Kon het Gaspedaal zoekveld niet vinden.");
-      }
-
-      await searchInput.click();
-      await searchInput.fill(query);
-      await pauseBetweenActions(page, actionDelayMs);
-      appliedQuery = normalizeInput(await searchInput.inputValue());
-    }
-
-    if (make) {
-      appliedMake = await selectComboboxValue(
-        page,
-        searchForm.locator('[data-testid="merk-dropdown"]').first(),
-        make,
-        "merk",
-        actionDelayMs
-      );
-    }
-
-    if (model) {
-      const modelInput = searchForm.locator('[data-testid="model-dropdown"]').first();
-      await waitForLocatorEnabled(modelInput, 5_000);
-      appliedModel = await selectComboboxValue(page, modelInput, model, "model", actionDelayMs);
-    }
-
-    if (yearMin) {
-      await selectComboboxValue(
-        page,
-        searchForm.locator('[data-testid="bmin-dropdown"]').first(),
-        yearMin,
-        "bouwjaar min",
-        actionDelayMs,
-        { numericTokenIndex: 0 }
-      );
-    }
-
-    if (yearMax) {
-      await selectComboboxValue(
-        page,
-        searchForm.locator('[data-testid="bmax-dropdown"]').first(),
-        yearMax,
-        "bouwjaar max",
-        actionDelayMs,
-        { numericTokenIndex: 0 }
-      );
-    }
-
-    if (fuelType) {
-      await selectComboboxValue(
-        page,
-        searchForm.locator('[data-testid="brnst-dropdown"]').first(),
-        fuelType,
-        "brandstof",
-        actionDelayMs,
-        { aliases: getFuelTypeAliases(fuelType) }
-      );
-    }
-
-    if (priceMin) {
-      await selectComboboxValue(
-        page,
-        searchForm.locator('[data-testid="pmin-dropdown"]').first(),
-        priceMin,
-        "prijs min",
-        actionDelayMs,
-        { numericTokenIndex: 0 }
-      );
-    }
-
-    if (priceMax) {
-      await selectComboboxValue(
-        page,
-        searchForm.locator('[data-testid="pmax-dropdown"]').first(),
-        priceMax,
-        "prijs max",
-        actionDelayMs,
-        { numericTokenIndex: 0 }
-      );
-    }
-
-    if (mileageMin) {
-      await selectComboboxValue(
-        page,
-        searchForm.locator('[data-testid="kmin-dropdown"]').first(),
-        mileageMin,
-        "kilometerstand min",
-        actionDelayMs,
-        { numericTokenIndex: 0 }
-      );
-    }
-
-    if (mileageMax) {
-      await selectComboboxValue(
-        page,
-        searchForm.locator('[data-testid="kmax-dropdown"]').first(),
-        mileageMax,
-        "kilometerstand max",
-        actionDelayMs,
-        { numericTokenIndex: 0 }
-      );
-    }
-
-    if (bodyType) {
-      const bodyTypeInput = searchForm.locator('[data-testid="crs-dropdown"]').first();
-
-      if (!(await bodyTypeInput.isVisible().catch(() => false))) {
-        await ensureAdvancedFiltersExpanded(page, searchForm, actionDelayMs);
-        advancedFiltersExpanded = true;
-      }
-
-      await selectComboboxValue(
-        page,
-        bodyTypeInput,
-        bodyType,
-        "carrosserie",
-        actionDelayMs,
-        {
-          aliases: getBodyTypeAliases(bodyType)
-        }
-      );
-    }
-
-    if (postcode || radius || powerMin || powerMax) {
-      await ensureAdvancedFiltersExpanded(page, searchForm, actionDelayMs);
-      advancedFiltersExpanded = true;
-    }
-
-    if (postcode) {
-      const postcodeInput = searchForm.locator('#pc-id, input[name="pc"]').first();
-      await postcodeInput.scrollIntoViewIfNeeded();
-      await postcodeInput.fill(postcode);
-      await pauseBetweenActions(page, actionDelayMs);
-    }
-
-    if (radius) {
-      const radiusInput = searchForm.locator('[data-testid="strl-dropdown"]').first();
-      await waitForLocatorEnabled(radiusInput, 5_000);
-      await selectComboboxValue(page, radiusInput, radius, "straal", actionDelayMs, {
-        numericTokenIndex: 0
-      });
-    }
-
-    if (powerMin) {
-      await selectComboboxValue(
-        page,
-        searchForm.locator('[data-testid="vmin-dropdown"]').first(),
-        powerMin,
-        "vermogen min",
-        actionDelayMs,
-        { numericTokenIndex: getPowerNumericTokenIndex(powerMin) }
-      );
-    }
-
-    if (powerMax) {
-      await selectComboboxValue(
-        page,
-        searchForm.locator('[data-testid="vmax-dropdown"]').first(),
-        powerMax,
-        "vermogen max",
-        actionDelayMs,
-        { numericTokenIndex: getPowerNumericTokenIndex(powerMax) }
-      );
-    }
-
-    const searchButton = await findVisibleLocator(
-      [
-        searchForm.getByRole("button", { name: /vinden|zoek/i }),
-        searchForm.locator('button[type="submit"]'),
-        searchForm.locator('input[type="submit"]')
-      ],
-      2_500
-    );
-
-    if (searchButton) {
-      await dismissBlockingUi(page);
-      if (advancedFiltersExpanded) {
-        await pauseBetweenActions(page, actionDelayMs);
-      }
-      await searchButton.scrollIntoViewIfNeeded();
-      await searchButton.click();
-    } else {
-      if (!query) {
-        throw new Error("Kon de knop om de zoekopdracht uit te voeren niet vinden.");
-      }
-
-      const searchInput = searchForm.locator('#trefw, input[name="trefw"]').first();
-      await searchInput.press("Enter");
-    }
-
-    await waitForSearchResults(page, beforeUrl, [query, make, model].filter((value): value is string => Boolean(value)));
-    const bodyText = normalizeWhitespace(await page.locator("body").innerText());
-    const listings = await extractListings(page);
-    const resultCountText = extractResultCountText(bodyText);
-    const totalMatches = parseDutchInteger(resultCountText);
-
-    return {
-      requestedQuery: query,
-      requestedMake: make,
-      requestedModel: model,
-      appliedQuery,
-      appliedMake,
-      appliedModel,
-      browser,
-      startUrl,
-      finalUrl: page.url(),
-      pageTitle: await page.title(),
-      searchTriggered:
-        page.url() !== beforeUrl || (query ? bodyText.toLowerCase().includes(query.toLowerCase()) : listings.length > 0),
-      resultCountText,
-      totalMatches,
-      pageListingCount: listings.length,
-      listings
-    };
-  } finally {
-    await context.close();
+  for (const extraPage of openPages.slice(1)) {
+    await extraPage.close().catch(() => undefined);
   }
+
+  return activePage;
 }
 
 async function launchRealBrowser(userDataDir: string, slowMoMs: number): Promise<BrowserLaunchResult> {

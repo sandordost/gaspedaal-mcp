@@ -1,9 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { searchGaspedaal } from "./gaspedaal";
+import { createPersistentGaspedaalSearchExecutor } from "./gaspedaal";
 
 const filterValueSchema = z.union([z.string().min(1), z.number()]);
+const searchExecutor = createPersistentGaspedaalSearchExecutor();
 
 const server = new McpServer({
   name: "gaspedaal-playwright-mcp",
@@ -50,7 +51,7 @@ server.registerTool(
     powerMin,
     powerMax
   }) => {
-    const result = await searchGaspedaal({
+    const result = await searchExecutor.search({
       query: query ?? undefined,
       make: make ?? (!query && !model ? "Cupra" : undefined),
       model: model ?? undefined,
@@ -89,3 +90,9 @@ main().catch((error) => {
   console.error("MCP server error:", error);
   process.exit(1);
 });
+
+for (const eventName of ["SIGINT", "SIGTERM", "beforeExit"] as const) {
+  process.once(eventName, () => {
+    void searchExecutor.close().catch(() => undefined);
+  });
+}

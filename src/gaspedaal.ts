@@ -8,6 +8,20 @@ export interface GaspedaalSearchOptions {
   query?: string;
   make?: string;
   model?: string;
+  yearMin?: string | number;
+  yearMax?: string | number;
+  fuelType?: string;
+  priceMin?: string | number;
+  priceMax?: string | number;
+  mileageMin?: string | number;
+  mileageMax?: string | number;
+  bodyType?: string;
+  postcode?: string;
+  radius?: string | number;
+  powerMin?: string | number;
+  powerMax?: string | number;
+  slowMoMs?: number;
+  actionDelayMs?: number;
   startUrl?: string;
   timeoutMs?: number;
 }
@@ -18,10 +32,19 @@ export interface GaspedaalListing {
   priceDisplay: string | null;
   priceEur: number | null;
   year: number | null;
+  mileage: number | null;
   mileageDisplay: string | null;
   mileageKm: number | null;
+  fuelType: string | null;
+  engineSize: string | null;
+  power: string | null;
+  transmission: string | null;
+  bodyType: string | null;
+  color: string | null;
+  doors: string | null;
   seller: string | null;
   location: string | null;
+  sources: string[];
   sourceSites: string[];
   features: string[];
   imageUrl: string | null;
@@ -51,10 +74,39 @@ interface BrowserLaunchResult {
   context: BrowserContext;
 }
 
+interface ParsedListingFeatures {
+  fuelType: string | null;
+  engineSize: string | null;
+  power: string | null;
+  transmission: string | null;
+  bodyType: string | null;
+  color: string | null;
+  doors: string | null;
+}
+
+interface ComboboxMatchOptions {
+  aliases?: string[];
+  numericTokenIndex?: number;
+}
+
 export async function searchGaspedaal(options: GaspedaalSearchOptions): Promise<GaspedaalSearchResult> {
   const query = normalizeInput(options.query);
   const make = normalizeInput(options.make);
   const model = normalizeInput(options.model);
+  const yearMin = normalizeInput(options.yearMin);
+  const yearMax = normalizeInput(options.yearMax);
+  const fuelType = normalizeInput(options.fuelType);
+  const priceMin = normalizeInput(options.priceMin);
+  const priceMax = normalizeInput(options.priceMax);
+  const mileageMin = normalizeInput(options.mileageMin);
+  const mileageMax = normalizeInput(options.mileageMax);
+  const bodyType = normalizeInput(options.bodyType);
+  const postcode = normalizeInput(options.postcode);
+  const radius = normalizeInput(options.radius);
+  const powerMin = normalizeInput(options.powerMin);
+  const powerMax = normalizeInput(options.powerMax);
+  const slowMoMs = options.slowMoMs ?? getDefaultSlowMoMs();
+  const actionDelayMs = options.actionDelayMs ?? getDefaultActionDelayMs();
 
   if (!query && !make && !model) {
     throw new Error("Geef minimaal een zoekterm, merk of model mee.");
@@ -64,14 +116,19 @@ export async function searchGaspedaal(options: GaspedaalSearchOptions): Promise<
     throw new Error("Een modelfilter vereist ook een merkfilter.");
   }
 
+  if (radius && !postcode) {
+    throw new Error("Een straalfilter vereist ook een postcode.");
+  }
+
   const startUrl = options.startUrl ?? GASPEDAAL_SEARCH_URL;
   const timeoutMs = options.timeoutMs ?? 45_000;
   const userDataDir = path.resolve(process.cwd(), ".playwright", "gaspedaal-profile");
-  const { browser, context } = await launchRealBrowser(userDataDir);
+  const { browser, context } = await launchRealBrowser(userDataDir, slowMoMs);
   const page = context.pages()[0] ?? (await context.newPage());
   let appliedQuery: string | null = null;
   let appliedMake: string | null = null;
   let appliedModel: string | null = null;
+  let advancedFiltersExpanded = false;
 
   try {
     await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
@@ -106,6 +163,7 @@ export async function searchGaspedaal(options: GaspedaalSearchOptions): Promise<
 
       await searchInput.click();
       await searchInput.fill(query);
+      await pauseBetweenActions(page, actionDelayMs);
       appliedQuery = normalizeInput(await searchInput.inputValue());
     }
 
@@ -114,14 +172,154 @@ export async function searchGaspedaal(options: GaspedaalSearchOptions): Promise<
         page,
         searchForm.locator('[data-testid="merk-dropdown"]').first(),
         make,
-        "merk"
+        "merk",
+        actionDelayMs
       );
     }
 
     if (model) {
       const modelInput = searchForm.locator('[data-testid="model-dropdown"]').first();
       await waitForLocatorEnabled(modelInput, 5_000);
-      appliedModel = await selectComboboxValue(page, modelInput, model, "model");
+      appliedModel = await selectComboboxValue(page, modelInput, model, "model", actionDelayMs);
+    }
+
+    if (yearMin) {
+      await selectComboboxValue(
+        page,
+        searchForm.locator('[data-testid="bmin-dropdown"]').first(),
+        yearMin,
+        "bouwjaar min",
+        actionDelayMs,
+        { numericTokenIndex: 0 }
+      );
+    }
+
+    if (yearMax) {
+      await selectComboboxValue(
+        page,
+        searchForm.locator('[data-testid="bmax-dropdown"]').first(),
+        yearMax,
+        "bouwjaar max",
+        actionDelayMs,
+        { numericTokenIndex: 0 }
+      );
+    }
+
+    if (fuelType) {
+      await selectComboboxValue(
+        page,
+        searchForm.locator('[data-testid="brnst-dropdown"]').first(),
+        fuelType,
+        "brandstof",
+        actionDelayMs,
+        { aliases: getFuelTypeAliases(fuelType) }
+      );
+    }
+
+    if (priceMin) {
+      await selectComboboxValue(
+        page,
+        searchForm.locator('[data-testid="pmin-dropdown"]').first(),
+        priceMin,
+        "prijs min",
+        actionDelayMs,
+        { numericTokenIndex: 0 }
+      );
+    }
+
+    if (priceMax) {
+      await selectComboboxValue(
+        page,
+        searchForm.locator('[data-testid="pmax-dropdown"]').first(),
+        priceMax,
+        "prijs max",
+        actionDelayMs,
+        { numericTokenIndex: 0 }
+      );
+    }
+
+    if (mileageMin) {
+      await selectComboboxValue(
+        page,
+        searchForm.locator('[data-testid="kmin-dropdown"]').first(),
+        mileageMin,
+        "kilometerstand min",
+        actionDelayMs,
+        { numericTokenIndex: 0 }
+      );
+    }
+
+    if (mileageMax) {
+      await selectComboboxValue(
+        page,
+        searchForm.locator('[data-testid="kmax-dropdown"]').first(),
+        mileageMax,
+        "kilometerstand max",
+        actionDelayMs,
+        { numericTokenIndex: 0 }
+      );
+    }
+
+    if (bodyType) {
+      const bodyTypeInput = searchForm.locator('[data-testid="crs-dropdown"]').first();
+
+      if (!(await bodyTypeInput.isVisible().catch(() => false))) {
+        await ensureAdvancedFiltersExpanded(page, searchForm, actionDelayMs);
+        advancedFiltersExpanded = true;
+      }
+
+      await selectComboboxValue(
+        page,
+        bodyTypeInput,
+        bodyType,
+        "carrosserie",
+        actionDelayMs,
+        {
+          aliases: getBodyTypeAliases(bodyType)
+        }
+      );
+    }
+
+    if (postcode || radius || powerMin || powerMax) {
+      await ensureAdvancedFiltersExpanded(page, searchForm, actionDelayMs);
+      advancedFiltersExpanded = true;
+    }
+
+    if (postcode) {
+      const postcodeInput = searchForm.locator('#pc-id, input[name="pc"]').first();
+      await postcodeInput.scrollIntoViewIfNeeded();
+      await postcodeInput.fill(postcode);
+      await pauseBetweenActions(page, actionDelayMs);
+    }
+
+    if (radius) {
+      const radiusInput = searchForm.locator('[data-testid="strl-dropdown"]').first();
+      await waitForLocatorEnabled(radiusInput, 5_000);
+      await selectComboboxValue(page, radiusInput, radius, "straal", actionDelayMs, {
+        numericTokenIndex: 0
+      });
+    }
+
+    if (powerMin) {
+      await selectComboboxValue(
+        page,
+        searchForm.locator('[data-testid="vmin-dropdown"]').first(),
+        powerMin,
+        "vermogen min",
+        actionDelayMs,
+        { numericTokenIndex: getPowerNumericTokenIndex(powerMin) }
+      );
+    }
+
+    if (powerMax) {
+      await selectComboboxValue(
+        page,
+        searchForm.locator('[data-testid="vmax-dropdown"]').first(),
+        powerMax,
+        "vermogen max",
+        actionDelayMs,
+        { numericTokenIndex: getPowerNumericTokenIndex(powerMax) }
+      );
     }
 
     const searchButton = await findVisibleLocator(
@@ -135,6 +333,9 @@ export async function searchGaspedaal(options: GaspedaalSearchOptions): Promise<
 
     if (searchButton) {
       await dismissBlockingUi(page);
+      if (advancedFiltersExpanded) {
+        await pauseBetweenActions(page, actionDelayMs);
+      }
       await searchButton.scrollIntoViewIfNeeded();
       await searchButton.click();
     } else {
@@ -175,7 +376,7 @@ export async function searchGaspedaal(options: GaspedaalSearchOptions): Promise<
   }
 }
 
-async function launchRealBrowser(userDataDir: string): Promise<BrowserLaunchResult> {
+async function launchRealBrowser(userDataDir: string, slowMoMs: number): Promise<BrowserLaunchResult> {
   await mkdir(userDataDir, { recursive: true });
 
   const browserCandidates = [
@@ -191,7 +392,7 @@ async function launchRealBrowser(userDataDir: string): Promise<BrowserLaunchResu
         headless: false,
         locale: "nl-NL",
         viewport: { width: 1440, height: 960 },
-        slowMo: 75,
+        slowMo: slowMoMs,
         args: ["--disable-blink-features=AutomationControlled"]
       });
 
@@ -218,37 +419,42 @@ async function dismissCookieBanner(page: Page): Promise<void> {
   const candidateNames = [/alles accepteren/i, /accepteren/i, /akkoord/i, /toestaan/i];
 
   for (const name of candidateNames) {
-    const button = await findVisibleLocator(
-      [page.getByRole("button", { name }), page.locator("button", { hasText: name })],
-      1_200
-    );
-
-    if (!button) {
-      continue;
+    if (await clickFirstVisible([page.getByRole("button", { name }), page.locator("button", { hasText: name })])) {
+      return;
     }
-
-    await button.click();
-    await page.waitForTimeout(500);
-    return;
   }
 }
 
 async function dismissLoginPopup(page: Page): Promise<void> {
-  const closeButton = await findVisibleLocator(
+  await clickFirstVisible(
     [
       page.locator('dialog[open] [data-testid="close-pop-up"]'),
       page.locator('[role="dialog"] [data-testid="close-pop-up"]'),
       page.locator('dialog [data-testid="close-pop-up"]')
-    ],
-    1_000
+    ]
   );
+}
 
-  if (!closeButton) {
-    return;
+async function ensureAdvancedFiltersExpanded(page: Page, searchForm: Locator, actionDelayMs: number): Promise<void> {
+  const advancedButton = searchForm.locator('[data-testid="advanced-filters-btn"]').first();
+
+  if ((await advancedButton.count()) === 0) {
+    throw new Error("Kon de knop voor meer filters niet vinden.");
   }
 
-  await closeButton.click();
-  await page.waitForTimeout(400);
+  const buttonText = normalizeWhitespaceOrNull(await getTextContent(advancedButton));
+
+  if (!buttonText?.toLowerCase().includes("minder filters")) {
+    await dismissBlockingUi(page);
+    await advancedButton.scrollIntoViewIfNeeded();
+    await advancedButton.click();
+    await pauseBetweenActions(page, actionDelayMs);
+  }
+
+  await searchForm.locator('#pc-id, [data-testid="vmin-dropdown"]').first().waitFor({
+    state: "visible",
+    timeout: 5_000
+  });
 }
 
 async function waitForSearchResults(page: Page, beforeUrl: string, searchHints: string[]): Promise<void> {
@@ -268,30 +474,33 @@ async function waitForSearchResults(page: Page, beforeUrl: string, searchHints: 
 
   await Promise.race(waiters).catch(() => undefined);
 
-  await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => undefined);
-  await page.waitForTimeout(1_500);
+  await page.waitForLoadState("networkidle", { timeout: 2_000 }).catch(() => undefined);
+  await page.locator('[data-testid="occasion-item"]').first().waitFor({ state: "visible", timeout: 2_000 }).catch(() => undefined);
 }
 
 async function selectComboboxValue(
   page: Page,
   input: Locator,
   value: string,
-  label: "merk" | "model"
+  label: string,
+  actionDelayMs: number,
+  matchOptions: ComboboxMatchOptions = {}
 ): Promise<string> {
   await dismissBlockingUi(page);
   await input.scrollIntoViewIfNeeded();
-  await input.click();
-  await input.fill(value);
-  await page.waitForTimeout(600);
-  const optionScope = await getComboboxOptionScope(page, input);
-  const matchingOption = optionScope.getByRole("option", {
-    name: new RegExp(`^${escapeRegExp(value)}(?:\\s*\\(|$)`, "i")
+  await input.click({ force: true }).catch(async () => {
+    await input.focus();
   });
+  await input.fill(value);
+  const optionScope = await getComboboxOptionScope(page, input);
+  const optionLocator = optionScope.getByRole("option");
+  await waitForComboboxOptions(optionLocator);
+  const matchingOptionIndex = await findMatchingOptionIndex(optionLocator, value, matchOptions);
 
-  if ((await matchingOption.count()) > 0) {
-    await matchingOption.first().click();
+  if (matchingOptionIndex !== null) {
+    await optionLocator.nth(matchingOptionIndex).click();
   } else {
-    const visibleOptions = await getTextList(optionScope.getByRole("option"));
+    const visibleOptions = await getTextList(optionLocator);
 
     if (visibleOptions.length === 0) {
       throw new Error(`Kon geen opties vinden voor ${label} "${value}".`);
@@ -302,7 +511,7 @@ async function selectComboboxValue(
     );
   }
 
-  await page.waitForTimeout(400);
+  await pauseBetweenActions(input.page(), actionDelayMs);
   const appliedValue = normalizeInput(await input.inputValue());
 
   if (!appliedValue) {
@@ -315,7 +524,7 @@ async function selectComboboxValue(
 async function getComboboxOptionScope(page: Page, input: Locator): Promise<Locator> {
   const inputId = await input.getAttribute("id");
 
-  for (let attempt = 0; attempt < 10; attempt += 1) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
     const activeControls = await input.getAttribute("aria-controls");
 
     if (activeControls) {
@@ -330,7 +539,7 @@ async function getComboboxOptionScope(page: Page, input: Locator): Promise<Locat
       }
     }
 
-    await page.waitForTimeout(100);
+    await page.waitForTimeout(50);
   }
 
   return page.locator("body");
@@ -344,10 +553,57 @@ async function waitForLocatorEnabled(locator: Locator, timeoutMs: number): Promi
       return;
     }
 
-    await locator.page().waitForTimeout(150);
+    await locator.page().waitForTimeout(100);
   }
 
   throw new Error("Het modelveld werd niet actief na het kiezen van een merk.");
+}
+
+async function findMatchingOptionIndex(
+  optionLocator: Locator,
+  rawValue: string,
+  matchOptions: ComboboxMatchOptions
+): Promise<number | null> {
+  const options = await getTextList(optionLocator);
+  const normalizedCandidates = dedupeStrings([rawValue, ...(matchOptions.aliases ?? [])]).map((value) =>
+    normalizeOptionMatchText(value)
+  );
+
+  for (const candidate of normalizedCandidates) {
+    const exactIndex = options.findIndex((option) => normalizeOptionMatchText(option) === candidate);
+
+    if (exactIndex !== -1) {
+      return exactIndex;
+    }
+  }
+
+  for (const candidate of normalizedCandidates) {
+    const prefixIndex = options.findIndex((option) => normalizeOptionMatchText(option).startsWith(candidate));
+
+    if (prefixIndex !== -1) {
+      return prefixIndex;
+    }
+  }
+
+  const targetNumber = parseFlexibleInteger(rawValue);
+
+  if (targetNumber !== null) {
+    const numericIndex = options.findIndex((option) => {
+      const numericTokens = extractNumericTokens(option);
+      const tokenIndex = matchOptions.numericTokenIndex ?? 0;
+      return numericTokens[tokenIndex] === targetNumber;
+    });
+
+    if (numericIndex !== -1) {
+      return numericIndex;
+    }
+  }
+
+  return null;
+}
+
+async function waitForComboboxOptions(optionLocator: Locator): Promise<void> {
+  await optionLocator.first().waitFor({ state: "visible", timeout: 1_200 }).catch(() => undefined);
 }
 
 async function extractListings(page: Page): Promise<GaspedaalListing[]> {
@@ -377,7 +633,7 @@ async function extractListings(page: Page): Promise<GaspedaalListing[]> {
     const sellerSection = contentSections.nth(1);
     const metaParagraphs = metaSection.locator(":scope > p");
     const yearMileageText = normalizeWhitespaceOrNull(await getTextContent(metaParagraphs.nth(0)));
-    const features = await getTextList(metaParagraphs.nth(1).locator("span"));
+    const features = dedupeStrings(await getTextList(metaParagraphs.nth(1).locator("span")));
     const sellerBlocks = sellerSection.locator(":scope > div");
     const sellerInfoBlock = sellerBlocks.nth(0);
     const sourceSitesBlock = sellerBlocks.nth(1);
@@ -390,6 +646,10 @@ async function extractListings(page: Page): Promise<GaspedaalListing[]> {
       /^Bekijk deze auto op:\s*/i,
       ""
     );
+    const sources = dedupeStrings(splitCommaList(sourceSitesText));
+    const mileageDisplay = extractMileageDisplay(yearMileageText);
+    const mileage = parseDutchInteger(mileageDisplay);
+    const parsedFeatures = parseListingFeatures(features);
 
     listings.push({
       listingId: await card.getAttribute("id"),
@@ -397,12 +657,21 @@ async function extractListings(page: Page): Promise<GaspedaalListing[]> {
       priceDisplay,
       priceEur: parseDutchInteger(priceDisplay),
       year: parseYear(yearMileageText),
-      mileageDisplay: extractMileageDisplay(yearMileageText),
-      mileageKm: parseDutchInteger(extractMileageDisplay(yearMileageText)),
+      mileage,
+      mileageDisplay,
+      mileageKm: mileage,
+      fuelType: parsedFeatures.fuelType,
+      engineSize: parsedFeatures.engineSize,
+      power: parsedFeatures.power,
+      transmission: parsedFeatures.transmission,
+      bodyType: parsedFeatures.bodyType,
+      color: parsedFeatures.color,
+      doors: parsedFeatures.doors,
       seller,
       location,
-      sourceSites: dedupeStrings(splitCommaList(sourceSitesText)),
-      features: dedupeStrings(features),
+      sources,
+      sourceSites: sources,
+      features,
       imageUrl: imageUrl ? toAbsoluteUrl(imageUrl) : null,
       href: href ? toAbsoluteUrl(href) : null
     });
@@ -430,12 +699,34 @@ function normalizeWhitespace(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
-function normalizeInput(value: string | null | undefined): string | null {
-  if (!value) {
+function getDefaultSlowMoMs(): number {
+  const envValue = process.env.PLAYWRIGHT_SLOWMO_MS;
+
+  if (!envValue) {
+    return 0;
+  }
+
+  const parsed = Number(envValue);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function getDefaultActionDelayMs(): number {
+  const envValue = process.env.GASPEDAAL_ACTION_DELAY_MS;
+
+  if (!envValue) {
+    return 500;
+  }
+
+  const parsed = Number(envValue);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
+}
+
+function normalizeInput(value: string | number | null | undefined): string | null {
+  if (value === null || value === undefined) {
     return null;
   }
 
-  const normalized = normalizeWhitespace(value);
+  const normalized = normalizeWhitespace(String(value));
   return normalized || null;
 }
 
@@ -446,6 +737,19 @@ function normalizeWhitespaceOrNull(value: string | null): string | null {
 
   const normalized = normalizeWhitespace(value);
   return normalized || null;
+}
+
+function normalizeOptionMatchText(value: string): string {
+  return stripOptionCount(value)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function stripOptionCount(value: string): string {
+  return value.replace(/\s*\([\d.]+\)\s*$/, "");
 }
 
 function extractResultCountText(bodyText: string): string | null {
@@ -486,6 +790,24 @@ function parseDutchInteger(value: string | null): number | null {
   return Number(digits);
 }
 
+function parseFlexibleInteger(value: string | null): number | null {
+  if (!value) {
+    return null;
+  }
+
+  const match = value.match(/\d[\d.]*/);
+
+  if (!match) {
+    return null;
+  }
+
+  return Number(match[0].replace(/\./g, ""));
+}
+
+function extractNumericTokens(value: string): number[] {
+  return Array.from(value.matchAll(/\d[\d.]*/g), (match) => Number(match[0].replace(/\./g, "")));
+}
+
 function parseYear(value: string | null): number | null {
   if (!value) {
     return null;
@@ -505,6 +827,120 @@ function extractMileageDisplay(value: string | null): string | null {
   return match ? `${match[1]} km` : null;
 }
 
+function getFuelTypeAliases(value: string): string[] {
+  const normalized = normalizeOptionMatchText(value);
+
+  switch (normalized) {
+    case "hybrid":
+    case "hybride":
+      return ["Hybride"];
+    case "electric":
+    case "elektrisch":
+      return ["Elektrisch"];
+    case "petrol":
+    case "gasoline":
+    case "benzine":
+      return ["Benzine"];
+    case "diesel":
+      return ["Diesel"];
+    case "plug in hybrid":
+    case "plug-in hybrid":
+    case "plug-in hybride":
+      return ["Plug-in hybride", "Hybride"];
+    default:
+      return [];
+  }
+}
+
+function getBodyTypeAliases(value: string): string[] {
+  const normalized = normalizeOptionMatchText(value);
+
+  switch (normalized) {
+    case "stationwagen":
+    case "stationwagon":
+      return ["Stationwagon"];
+    case "coupe":
+    case "coupé":
+      return ["Coupé"];
+    case "suv":
+    case "terreinwagen":
+      return ["SUV / Terreinwagen"];
+    case "bedrijfswagen":
+    case "bedrijfswagens":
+    case "bestelwagen":
+      return ["Bedrijfswagens"];
+    default:
+      return [];
+  }
+}
+
+function getPowerNumericTokenIndex(value: string): number {
+  return /\bpk\b/i.test(value) ? 1 : 0;
+}
+
+function parseListingFeatures(features: string[]): ParsedListingFeatures {
+  const remaining = [...features];
+  const fuelType = takeFirstMatching(remaining, isFuelTypeFeature);
+  const engineSize = takeFirstMatching(remaining, isEngineSizeFeature);
+  const power = takeFirstMatching(remaining, isPowerFeature);
+  const transmission = takeFirstMatching(remaining, isTransmissionFeature);
+  const doors = takeFirstMatching(remaining, isDoorsFeature);
+  const bodyType = takeFirstMatching(remaining, isBodyTypeFeature) ?? remaining.shift() ?? null;
+  const color = takeFirstMatching(remaining, isColorFeature) ?? remaining.shift() ?? null;
+
+  return {
+    fuelType,
+    engineSize,
+    power,
+    transmission,
+    bodyType,
+    color,
+    doors
+  };
+}
+
+function takeFirstMatching(values: string[], predicate: (value: string) => boolean): string | null {
+  const index = values.findIndex(predicate);
+
+  if (index === -1) {
+    return null;
+  }
+
+  return values.splice(index, 1)[0] ?? null;
+}
+
+function isFuelTypeFeature(value: string): boolean {
+  return /^(benzine|diesel|elektrisch|hybride|lpg|aardgas|cng|waterstof|ethanol|plug-in hybride)$/i.test(value);
+}
+
+function isEngineSizeFeature(value: string): boolean {
+  return /^\d[\d.]*\s*cc$/i.test(value);
+}
+
+function isPowerFeature(value: string): boolean {
+  return /^\d[\d.,]*\s*kW$/i.test(value);
+}
+
+function isTransmissionFeature(value: string): boolean {
+  return /^(automaat|handgeschakeld|semi-automaat|cvt|automatisch)$/i.test(value);
+}
+
+function isDoorsFeature(value: string): boolean {
+  return /^\d+\s*-?\s*deurs$/i.test(value);
+}
+
+function isBodyTypeFeature(value: string): boolean {
+  return /^(suv\s*\/\s*terreinwagen|hatchback|sedan|stationwagon|stationwagen|cabriolet|coupe|mpv|bedrijfswagens|bestelauto|bestelbus|personenbus|pick-?up|camper|limousine|chassis cabine|bus|overig)$/i.test(
+    value
+  );
+}
+
+function isColorFeature(value: string): boolean {
+  return /^(zwart|wit|grijs|blauw|rood|groen|geel|oranje|bruin|beige|paars|roze|zilver|goud|creme|antraciet|turquoise|overig)$/i.test(
+    value
+  );
+}
+
 function dedupeStrings(values: string[]): string[] {
   return Array.from(new Set(values.filter(Boolean)));
 }
@@ -518,6 +954,41 @@ function splitCommaList(value: string): string[] {
 
 function toAbsoluteUrl(value: string): string {
   return new URL(value, "https://www.gaspedaal.nl").toString();
+}
+
+async function clickFirstVisible(candidates: Locator[]): Promise<boolean> {
+  for (const candidate of candidates) {
+    const locator = candidate.first();
+
+    if (!(await isLocatorVisible(locator))) {
+      continue;
+    }
+
+    try {
+      await locator.click({ timeout: 400 });
+      return true;
+    } catch {
+      continue;
+    }
+  }
+
+  return false;
+}
+
+async function isLocatorVisible(locator: Locator): Promise<boolean> {
+  if ((await locator.count()) === 0) {
+    return false;
+  }
+
+  return locator.isVisible().catch(() => false);
+}
+
+async function pauseBetweenActions(page: Page, actionDelayMs: number): Promise<void> {
+  if (actionDelayMs <= 0) {
+    return;
+  }
+
+  await page.waitForTimeout(actionDelayMs);
 }
 
 async function getTextContent(locator: Locator): Promise<string | null> {

@@ -30,6 +30,7 @@ Dat opent een echte browser, gaat naar [Gaspedaal zoeken](https://www.gaspedaal.
 - het totale aantal matches
 - het aantal listings op de huidige pagina
 - een lijst met dataset-records zoals prijs, bouwjaar, kilometerstand, verkoper, locatie, kenmerken en bron-sites
+- per listing ook expliciete velden zoals `year`, `mileage`, `fuelType`, `engineSize`, `power`, `transmission`, `bodyType`, `color`, `doors`, `location`, `imageUrl` en `sources`
 
 ## MCP-server starten
 
@@ -38,13 +39,24 @@ npm run build
 npm run start
 ```
 
-De server exposeert een tool `search_gaspedaal` met optionele argumenten `query`, `make` en `model`.
+De server exposeert een tool `search_gaspedaal` met optionele argumenten voor:
+
+- `query`, `make`, `model`
+- `yearMin`, `yearMax`
+- `fuelType`
+- `priceMin`, `priceMax`
+- `mileageMin`, `mileageMax`
+- `bodyType`
+- `postcode`, `radius`
+- `powerMin`, `powerMax`
 
 Voorbeelden:
 
 - alleen vrije zoekterm: `query = "Cupra"`
 - merkfilter: `make = "Cupra"`
 - merk + model: `make = "Cupra", model = "Formentor"`
+- merk + model + basisfilters: `make = "Cupra", model = "Formentor", fuelType = "Hybride", yearMin = 2022, priceMax = 35000`
+- merk + model + uitgebreide filters: `make = "Cupra", model = "Formentor", postcode = "3511AB", radius = 25, powerMin = 150`
 
 ## Belangrijke beperking
 
@@ -53,3 +65,11 @@ Omdat Gaspedaal scraping actief probeert te blokkeren, is dit expres opgezet ron
 - selectors hardenen
 - cookie- en consentflows uitbreiden
 - resultaatkaarten gericht parsen
+
+## Snelheid
+
+De standaardinstelling draait nu zonder Playwright slow-motion. Als je expres langzamer wilt debuggen, kun je optioneel een environment variable zetten:
+
+```bash
+PLAYWRIGHT_SLOWMO_MS=75 npm run demo:cupra
+```

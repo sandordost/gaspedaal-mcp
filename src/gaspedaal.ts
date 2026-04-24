@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { access, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { chromium, type BrowserContext, type Locator, type Page } from "playwright-core";
 
@@ -66,6 +66,8 @@ export interface GaspedaalSearchResult {
   resultCountText: string | null;
   totalMatches: number | null;
   pageListingCount: number;
+  queryLooksRelevant: boolean | null;
+  queryRelevanceNotes: string[];
   listings: GaspedaalListing[];
 }
 
@@ -497,6 +499,7 @@ async function runGaspedaalSearch(
   const listings = await extractListings(page);
   const resultCountText = extractResultCountText(bodyText);
   const totalMatches = parseDutchInteger(resultCountText);
+  const queryRelevance = assessQueryRelevance(query, await page.title(), page.url(), listings);
 
   return {
     requestedQuery: query,
@@ -514,6 +517,8 @@ async function runGaspedaalSearch(
     resultCountText,
     totalMatches,
     pageListingCount: listings.length,
+    queryLooksRelevant: queryRelevance.looksRelevant,
+    queryRelevanceNotes: queryRelevance.notes,
     listings
   };
 }
@@ -590,11 +595,32 @@ async function getOrCreateSearchPage(context: BrowserContext): Promise<Page> {
 async function launchRealBrowser(userDataDir: string, slowMoMs: number): Promise<BrowserLaunchResult> {
   await mkdir(userDataDir, { recursive: true });
 
+  const executableCandidates = await getBrowserExecutableCandidates();
   const browserCandidates = [
     { browser: "Microsoft Edge", channel: "msedge" as const },
     { browser: "Google Chrome", channel: "chrome" as const }
   ];
   const launchErrors: string[] = [];
+
+  for (const candidate of executableCandidates) {
+    try {
+      const context = await chromium.launchPersistentContext(userDataDir, {
+        executablePath: candidate.executablePath,
+        headless: false,
+        locale: "nl-NL",
+        viewport: { width: 1440, height: 960 },
+        slowMo: slowMoMs,
+        args: ["--disable-blink-features=AutomationControlled"]
+      });
+
+      return {
+        browser: candidate.browser,
+        context
+      };
+    } catch (error) {
+      launchErrors.push(`${candidate.browser}: ${toErrorMessage(error)}`);
+    }
+  }
 
   for (const candidate of browserCandidates) {
     try {
@@ -617,23 +643,86 @@ async function launchRealBrowser(userDataDir: string, slowMoMs: number): Promise
   }
 
   throw new Error(
-    `Kon geen echte browser starten via Playwright. Zorg dat Edge of Chrome is geinstalleerd.\n${launchErrors.join("\n")}`
+    "Kon geen echte browser starten via Playwright. " +
+      "Installeer Edge, Chrome of Chromium, of zet GASPEDAAL_BROWSER_EXECUTABLE_PATH naar een geldige browserbinary.\n" +
+      launchErrors.join("\n")
   );
+}
+
+async function getBrowserExecutableCandidates(): Promise<Array<{ browser: string; executablePath: string }>> {
+  const candidates: Array<{ browser: string; executablePath: string }> = [];
+  const configuredExecutablePath = normalizeWhitespaceOrNull(process.env.GASPEDAAL_BROWSER_EXECUTABLE_PATH ?? null);
+
+  if (configuredExecutablePath) {
+    candidates.push({
+      browser: `Configured browser (${configuredExecutablePath})`,
+      executablePath: configuredExecutablePath
+    });
+  }
+
+  const linuxExecutableCandidates = [
+    { browser: "Chromium", executablePath: "/usr/bin/chromium" },
+    { browser: "Chromium Browser", executablePath: "/usr/bin/chromium-browser" },
+    { browser: "Google Chrome", executablePath: "/usr/bin/google-chrome-stable" },
+    { browser: "Google Chrome", executablePath: "/usr/bin/google-chrome" },
+    { browser: "Microsoft Edge", executablePath: "/usr/bin/microsoft-edge-stable" },
+    { browser: "Microsoft Edge", executablePath: "/usr/bin/microsoft-edge" }
+  ];
+
+  for (const candidate of linuxExecutableCandidates) {
+    if (await canAccessExecutable(candidate.executablePath)) {
+      candidates.push(candidate);
+    }
+  }
+
+  return candidates;
+}
+
+async function canAccessExecutable(executablePath: string): Promise<boolean> {
+  try {
+    await access(executablePath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function dismissBlockingUi(page: Page): Promise<void> {
   await dismissCookieBanner(page);
   await dismissLoginPopup(page);
+  await dismissCookieBanner(page);
 }
 
 async function dismissCookieBanner(page: Page): Promise<void> {
-  const candidateNames = [/alles accepteren/i, /accepteren/i, /akkoord/i, /toestaan/i];
+  const popupScopes = [page.locator("#as24-cmp-popup"), page.locator('[id*="cmp-popup"]'), page.locator('[class*="cmp-popup"]')];
+  const candidateNames = [/alles accepteren/i, /accepteren/i, /akkoord/i, /toestaan/i, /opslaan/i, /verder/i];
+
+  for (const popupScope of popupScopes) {
+    if (!(await isLocatorVisible(popupScope.first()))) {
+      continue;
+    }
+
+    for (const name of candidateNames) {
+      if (
+        await clickFirstVisible(
+          [popupScope.getByRole("button", { name }), popupScope.locator("button", { hasText: name })],
+          1_000
+        )
+      ) {
+        await waitForCookiePopupToDisappear(page);
+        return;
+      }
+    }
+  }
 
   for (const name of candidateNames) {
-    if (await clickFirstVisible([page.getByRole("button", { name }), page.locator("button", { hasText: name })])) {
+    if (await clickFirstVisible([page.getByRole("button", { name }), page.locator("button", { hasText: name })], 1_000)) {
+      await waitForCookiePopupToDisappear(page);
       return;
     }
   }
+
+  await forceHideKnownBlockingOverlays(page);
 }
 
 async function dismissLoginPopup(page: Page): Promise<void> {
@@ -706,10 +795,17 @@ async function selectComboboxValue(
   const optionScope = await getComboboxOptionScope(page, input);
   const optionLocator = optionScope.getByRole("option");
   await waitForComboboxOptions(optionLocator);
+  await dismissBlockingUi(page);
   const matchingOptionIndex = await findMatchingOptionIndex(optionLocator, value, matchOptions);
 
   if (matchingOptionIndex !== null) {
-    await optionLocator.nth(matchingOptionIndex).click();
+    const selectedOption = optionLocator.nth(matchingOptionIndex);
+    await selectedOption.scrollIntoViewIfNeeded().catch(() => undefined);
+    await dismissBlockingUi(page);
+    await selectedOption.click({ timeout: 3_000 }).catch(async () => {
+      await dismissBlockingUi(page);
+      await selectedOption.click({ force: true, timeout: 3_000 });
+    });
   } else {
     const visibleOptions = await getTextList(optionLocator);
 
@@ -811,6 +907,51 @@ async function findMatchingOptionIndex(
   }
 
   return null;
+}
+
+function assessQueryRelevance(
+  query: string | null,
+  pageTitle: string,
+  finalUrl: string,
+  listings: GaspedaalListing[]
+): { looksRelevant: boolean | null; notes: string[] } {
+  if (!query) {
+    return { looksRelevant: null, notes: [] };
+  }
+
+  const significantTokens = getSignificantQueryTokens(query);
+
+  if (significantTokens.length === 0) {
+    return { looksRelevant: null, notes: [] };
+  }
+
+  const haystacks = [pageTitle, decodeURIComponent(finalUrl), ...listings.slice(0, 5).map((listing) => listing.title)].map((value) =>
+    normalizeOptionMatchText(value)
+  );
+  const matchedTokens = significantTokens.filter((token) => haystacks.some((haystack) => haystack.includes(token)));
+  const notes: string[] = [];
+
+  if (matchedTokens.length === 0) {
+    notes.push(`Geen van de belangrijke query-termen kwam terug in URL, paginatitel of de eerste ${Math.min(listings.length, 5)} resultaten.`);
+  } else if (matchedTokens.length < significantTokens.length) {
+    notes.push(`Slechts ${matchedTokens.length} van ${significantTokens.length} belangrijke query-termen kwamen terug in de eerste resultaten.`);
+  }
+
+  return {
+    looksRelevant: matchedTokens.length > 0,
+    notes
+  };
+}
+
+function getSignificantQueryTokens(query: string): string[] {
+  const ignoredTokens = new Set(["auto", "occasion", "occasions", "met", "van", "de", "het", "een"]);
+
+  return dedupeStrings(
+    query
+      .split(/[^a-z0-9]+/i)
+      .map((token) => token.trim().toLowerCase())
+      .filter((token) => token.length >= 2 && !ignoredTokens.has(token))
+  ).map((token) => normalizeOptionMatchText(token));
 }
 
 async function waitForComboboxOptions(optionLocator: Locator): Promise<void> {
@@ -1167,7 +1308,7 @@ function toAbsoluteUrl(value: string): string {
   return new URL(value, "https://www.gaspedaal.nl").toString();
 }
 
-async function clickFirstVisible(candidates: Locator[]): Promise<boolean> {
+async function clickFirstVisible(candidates: Locator[], timeoutMs = 400): Promise<boolean> {
   for (const candidate of candidates) {
     const locator = candidate.first();
 
@@ -1176,7 +1317,7 @@ async function clickFirstVisible(candidates: Locator[]): Promise<boolean> {
     }
 
     try {
-      await locator.click({ timeout: 400 });
+      await locator.click({ timeout: timeoutMs });
       return true;
     } catch {
       continue;
@@ -1239,4 +1380,25 @@ function toErrorMessage(error: unknown): string {
   }
 
   return String(error);
+}
+
+async function waitForCookiePopupToDisappear(page: Page): Promise<void> {
+  await page.locator("#as24-cmp-popup, [id*='cmp-popup'], [class*='cmp-popup']").first().waitFor({
+    state: "hidden",
+    timeout: 2_000
+  }).catch(() => undefined);
+}
+
+async function forceHideKnownBlockingOverlays(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const selectors = ["#as24-cmp-popup", "[id*='cmp-popup']", "[class*='cmp-popup']", ".as24-cmp-popup"];
+
+    for (const selector of selectors) {
+      for (const element of Array.from(document.querySelectorAll<HTMLElement>(selector))) {
+        element.style.setProperty("display", "none", "important");
+        element.style.setProperty("pointer-events", "none", "important");
+        element.setAttribute("aria-hidden", "true");
+      }
+    }
+  }).catch(() => undefined);
 }

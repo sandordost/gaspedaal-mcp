@@ -20,33 +20,35 @@ Voor vrijwel alle installatiemethoden heb je dit nodig:
 - Node.js 20 of hoger
 - npm
 - Git
-- Microsoft Edge of Google Chrome
+- Microsoft Edge, Google Chrome of Chromium
 - een grafische desktop-sessie
 - internettoegang
 
 Let op:
 
-- Chromium alleen is niet genoeg; deze code probeert standaard Edge of Chrome te starten
+- op Linux probeert de server ook veelvoorkomende browserbinaries zoals `chromium`, `google-chrome-stable` en `microsoft-edge-stable`
+- als autodetectie niet lukt, kun je `GASPEDAAL_BROWSER_EXECUTABLE_PATH` zetten naar een expliciet browserpad
 - op een headless server zonder desktopomgeving gaat deze setup meestal niet werken
 - de eerste run is meestal het langzaamst; latere MCP-calls kunnen sneller zijn doordat de browser warm blijft
 
 ## Installatie Voor Een AI Agent
 
-Dit project is bedoeld voor een MCP-capabele agent, bijvoorbeeld een desktop-agent of editor-integratie die stdio-MCP ondersteunt.
+Dit project is bedoeld voor een MCP-capabele agent die remote MCP via `HTTP`, `SSE` of `streamable-http` ondersteunt.
 
 Belangrijk:
 
-- deze repository exposeert op dit moment een `stdio` MCP-server
-- voor remote gebruik over Tailscale is de veiligste route meestal `ssh` over je tailnet
-- een directe remote MCP-URL is pas logisch als je later ook een HTTP-transport toevoegt
+- deze repository exposeert een HTTP MCP-endpoint op `/mcp`
+- standaard bindt de server op `127.0.0.1` en poort `3100`
+- voor remote gebruik over Tailscale publiceer je dit endpoint het liefst alleen binnen je tailnet
 
 ### Stappen
 
 1. Clone de repository.
 2. Installeer de npm-dependencies.
 3. Build de server naar `dist/`.
-4. Registreer `node dist/index.js` als MCP-server in je agent.
-5. Herstart je agent.
+4. Start de server.
+5. Registreer de MCP-URL in je agent.
+6. Herstart je agent.
 
 ### Repository lokaal ophalen
 
@@ -64,29 +66,20 @@ npm run build
 
 ### MCP-configuratie voor een agent
 
-Gebruik als command de gebouwde entrypoint:
+Start eerst de server:
 
-```json
-{
-  "mcpServers": {
-    "gaspedaal": {
-      "command": "node",
-      "args": ["/absolute/path/to/gaspedaal-mcp/dist/index.js"],
-      "cwd": "/absolute/path/to/gaspedaal-mcp"
-    }
-  }
-}
+```bash
+npm run build
+PORT=3100 npm run start
 ```
 
-Voor Windows ziet dat er meestal zo uit:
+Daarna registreer je in je agent een remote MCP-server die naar jouw endpoint wijst:
 
 ```json
 {
   "mcpServers": {
     "gaspedaal": {
-      "command": "node",
-      "args": ["A:\\Git\\gaspedaal-mcp\\dist\\index.js"],
-      "cwd": "A:\\Git\\gaspedaal-mcp"
+      "url": "http://127.0.0.1:3100/mcp"
     }
   }
 }
@@ -94,9 +87,9 @@ Voor Windows ziet dat er meestal zo uit:
 
 Belangrijk voor agents:
 
-- de agent moet lokale processen mogen starten
-- de agent moet toegang hebben tot een desktop/browser-sessie
-- als je agent sandboxed draait zonder GUI, zal deze MCP-server waarschijnlijk niet werken
+- de host waarop deze server draait moet toegang hebben tot een desktop/browser-sessie
+- als je agent of server sandboxed draait zonder GUI, zal de zoektool waarschijnlijk niet werken
+- als agent en MCP-server op verschillende machines staan, gebruik dan een private netwerkroute zoals Tailscale
 
 ## Handmatige Installatie Per OS
 
@@ -114,6 +107,7 @@ Browser:
 
 - installeer Google Chrome via AUR, bijvoorbeeld met `yay -S google-chrome`
 - of installeer Edge via AUR, bijvoorbeeld met `yay -S microsoft-edge-stable-bin`
+- of installeer Chromium via `sudo pacman -S chromium`
 
 Daarna:
 
@@ -154,6 +148,12 @@ git clone <jouw-repo-url>
 cd gaspedaal-mcp
 npm install
 npm run build
+```
+
+Als je browser op een ongebruikelijk pad staat, kun je expliciet een binary forceren:
+
+```bash
+GASPEDAAL_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium npm run demo:cupra
 ```
 
 ### Ubuntu
@@ -276,28 +276,28 @@ De server exposeert een tool `search_gaspedaal`.
 
 Let op:
 
-- dit proces blijft op de voorgrond draaien; dat is normaal voor een `stdio` MCP-server
-- normaal start je agent dit proces zelf en hoef je het niet handmatig los te laten draaien
+- dit proces start een HTTP MCP-server op `http://127.0.0.1:3100/mcp`
+- gebruik `PORT` als je een andere poort wilt
+- voor productie is een systemd-service logisch zodra de host-setup stabiel is
 
 ## Veilig Verbinden Via Tailscale En OpenClaw
 
-De huidige setup is `stdio`-only. Dat betekent dat OpenClaw deze MCP-server niet het best via een open netwerkpoort benadert, maar door lokaal een `ssh`-proces te starten dat via Tailscale naar de andere machine gaat.
+De huidige setup is HTTP-gebaseerd. Dat betekent dat OpenClaw deze MCP-server als remote MCP-endpoint kan benaderen via een private URL binnen je tailnet.
 
 Aanbevolen route:
 
 ```text
 OpenClaw host (100.80.102.47)
-  -> ssh over Tailscale
+  -> HTTP over Tailscale
 MCP host (100.86.139.102)
-  -> node dist/index.js
+  -> gaspedaal-mcp op /mcp
 ```
 
 Voordelen van deze aanpak:
 
-- je hoeft geen extra HTTP-poort voor MCP open te zetten
 - alle MCP-communicatie blijft binnen je tailnet
-- je kunt gewone SSH-sleutels en Tailscale ACLs gebruiken
-- dit sluit goed aan op hoe deze server nu al gebouwd is
+- je kunt Tailscale ACLs en eventueel `tailscale serve` gebruiken
+- dit sluit goed aan op hoe deze server nu gebouwd is
 
 ### Voorwaarden
 
@@ -312,46 +312,35 @@ Tussen beide machines:
 
 - beide machines zitten in dezelfde tailnet
 - `tailscale ping 100.86.139.102` werkt vanaf de OpenClaw-host
-- SSH werkt vanaf de OpenClaw-host naar de MCP-host
+- de MCP-host draait de HTTP-server en luistert op de verwachte poort
 
-### Stap 1: test SSH over Tailscale
+### Stap 1: test de lokale HTTP-server op de MCP-host
 
-Test eerst of je vanaf de OpenClaw-machine de MCP-server op afstand kunt starten:
+Test op de MCP-host:
 
 ```bash
-ssh gaspedaal@100.86.139.102 "cd /opt/gaspedaal-mcp && /usr/bin/node dist/index.js"
+curl -i http://127.0.0.1:3100/mcp
 ```
 
 Let op:
 
-- dit commando blijft openstaan; dat is normaal voor `stdio` MCP
-- als SSH niet werkt, zal OpenClaw later ook niet kunnen verbinden
+- `GET /mcp` zonder sessie geeft meestal een foutmelding terug; dat is normaal
+- belangrijker is dat je een HTTP-response krijgt en dat de service draait
 
-### Stap 2: registreer de server in OpenClaw
+### Stap 2: maak de server bereikbaar binnen Tailscale
 
-Voor OpenClaw is dit nog steeds een `stdio`-server, alleen loopt de stdio-verbinding via `ssh`.
+De eenvoudigste varianten zijn:
 
-Voorbeeld:
+- bind de service direct op een Tailscale-bereikbaar adres
+- of gebruik `tailscale serve` om een lokale poort veilig binnen je tailnet te publiceren
 
-```bash
-openclaw mcp set gaspedaal '{
-  "command": "ssh",
-  "args": [
-    "-o",
-    "BatchMode=yes",
-    "gaspedaal@100.86.139.102",
-    "cd /opt/gaspedaal-mcp && /usr/bin/node dist/index.js"
-  ]
-}'
-```
-
-Controleer daarna:
+Voorbeeld met Tailscale Serve op de MCP-host:
 
 ```bash
-openclaw mcp show gaspedaal --json
+sudo tailscale serve --bg 3100
 ```
 
-Je kunt hiervoor ook MagicDNS gebruiken in plaats van een Tailnet IP, zolang naamresolutie in jouw tailnet goed werkt.
+Controleer daarna vanaf de OpenClaw-host via de private Tailscale Serve-URL van die machine.
 
 ### Voorbeeldconfiguratie
 
@@ -360,13 +349,7 @@ Je kunt hiervoor ook MagicDNS gebruiken in plaats van een Tailnet IP, zolang naa
   "mcp": {
     "servers": {
       "gaspedaal": {
-        "command": "ssh",
-        "args": [
-          "-o",
-          "BatchMode=yes",
-          "gaspedaal@100.86.139.102",
-          "cd /opt/gaspedaal-mcp && /usr/bin/node dist/index.js"
-        ]
+        "url": "https://<mcp-host>.<tailnet>.ts.net/mcp"
       }
     }
   }
@@ -375,17 +358,10 @@ Je kunt hiervoor ook MagicDNS gebruiken in plaats van een Tailnet IP, zolang naa
 
 ### Veiligheidsadvies
 
-- gebruik SSH keys, niet een interactief wachtwoord
 - beperk toegang met Tailscale ACLs zodat alleen je OpenClaw-machine de MCP-host mag bereiken
 - gebruik bij voorkeur Tailscale tags voor servermachines, niet voor laptops of user-devices
 - expose deze MCP-server niet publiek naar internet
-- als je later een HTTP MCP-transport toevoegt, gebruik dan bij voorkeur Tailscale Serve in plaats van een publieke Funnel
-
-### Wanneer je wel een remote MCP-URL zou gebruiken
-
-OpenClaw ondersteunt ook remote MCP-verbindingen via `HTTP`, `SSE` en `streamable-http`, maar deze repository levert dat transport nu nog niet mee.
-
-Wil je later een echte URL zoals `https://...` of een private Tailscale-served endpoint gebruiken, dan moet je eerst een extra HTTP-entrypoint aan deze code toevoegen.
+- gebruik bij voorkeur Tailscale Serve in plaats van een publieke Funnel
 
 ## Ondersteunde Input Velden
 
@@ -433,10 +409,10 @@ Als dit werkt, weet je dat:
 
 ### 2. MCP in een agent gebruiken
 
-Na `npm run build` laat je de agent deze entrypoint starten:
+Na `npm run build` en `npm run start` laat je de agent verbinden met:
 
 ```text
-node /absolute/path/to/gaspedaal-mcp/dist/index.js
+http://127.0.0.1:3100/mcp
 ```
 
 Daarna kan de agent de tool `search_gaspedaal` aanroepen.
@@ -476,6 +452,8 @@ Per run krijg je:
 - de paginatitel
 - `totalMatches`
 - `pageListingCount`
+- `queryLooksRelevant`
+- `queryRelevanceNotes`
 - `listings`
 
 Per listing zitten onder andere deze velden in de dataset:

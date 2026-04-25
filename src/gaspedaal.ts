@@ -20,6 +20,7 @@ export interface GaspedaalSearchOptions {
   radius?: string | number;
   powerMin?: string | number;
   powerMax?: string | number;
+  includeSourceUrls?: boolean;
   slowMoMs?: number;
   actionDelayMs?: number;
   startUrl?: string;
@@ -43,11 +44,14 @@ export interface GaspedaalListing {
   color: string | null;
   doors: string | null;
   seller: string | null;
+  sellerUrl: string | null;
   location: string | null;
   sources: string[];
+  sourceUrls: string[];
   sourceSites: string[];
   features: string[];
   imageUrl: string | null;
+  gaspedaalUrl: string | null;
   href: string | null;
 }
 
@@ -107,6 +111,7 @@ interface NormalizedGaspedaalSearchOptions {
   radius: string | null;
   powerMin: string | null;
   powerMax: string | null;
+  includeSourceUrls: boolean;
   slowMoMs: number;
   actionDelayMs: number;
   startUrl: string;
@@ -115,6 +120,11 @@ interface NormalizedGaspedaalSearchOptions {
 
 interface ReusableBrowserSession extends BrowserLaunchResult {
   slowMoMs: number;
+}
+
+interface ListingStructuredMetadata {
+  gaspedaalUrl: string | null;
+  sellerUrl: string | null;
 }
 
 export interface PersistentGaspedaalSearchExecutorOptions {
@@ -270,6 +280,7 @@ async function runGaspedaalSearch(
   const radius = normalizeInput(options.radius);
   const powerMin = normalizeInput(options.powerMin);
   const powerMax = normalizeInput(options.powerMax);
+  const includeSourceUrls = options.includeSourceUrls;
   const actionDelayMs = options.actionDelayMs;
   const startUrl = options.startUrl;
   const timeoutMs = options.timeoutMs;
@@ -497,6 +508,11 @@ async function runGaspedaalSearch(
   await waitForSearchResults(page, beforeUrl, [query, make, model].filter((value): value is string => Boolean(value)));
   const bodyText = normalizeWhitespace(await page.locator("body").innerText());
   const listings = await extractListings(page);
+
+  if (includeSourceUrls) {
+    await enrichListingsWithSourceUrls(page, listings, actionDelayMs);
+  }
+
   const resultCountText = extractResultCountText(bodyText);
   const totalMatches = parseDutchInteger(resultCountText);
   const queryRelevance = assessQueryRelevance(query, await page.title(), page.url(), listings);
@@ -541,6 +557,7 @@ function normalizeSearchOptions(options: GaspedaalSearchOptions): NormalizedGasp
   const powerMax = normalizeInput(options.powerMax);
   const slowMoMs = options.slowMoMs ?? getDefaultSlowMoMs();
   const actionDelayMs = options.actionDelayMs ?? getDefaultActionDelayMs();
+  const includeSourceUrls = options.includeSourceUrls ?? false;
 
   if (!query && !make && !model) {
     throw new Error("Geef minimaal een zoekterm, merk of model mee.");
@@ -570,6 +587,7 @@ function normalizeSearchOptions(options: GaspedaalSearchOptions): NormalizedGasp
     radius,
     powerMin,
     powerMax,
+    includeSourceUrls,
     slowMoMs,
     actionDelayMs,
     startUrl: options.startUrl ?? GASPEDAAL_SEARCH_URL,
@@ -962,9 +980,12 @@ async function extractListings(page: Page): Promise<GaspedaalListing[]> {
   const cards = page.locator('[data-testid="occasion-item"]');
   const cardCount = await cards.count();
   const listings: GaspedaalListing[] = [];
+  const structuredMetadata = await extractStructuredListingMetadata(page);
+  const currentSearchUrl = stripHashFromUrl(page.url());
 
   for (let index = 0; index < cardCount; index += 1) {
     const card = cards.nth(index);
+    const cardId = await card.getAttribute("id");
     const href = await card.getAttribute("href");
 
     if (href?.startsWith("/importautos")) {
@@ -1002,9 +1023,13 @@ async function extractListings(page: Page): Promise<GaspedaalListing[]> {
     const mileageDisplay = extractMileageDisplay(yearMileageText);
     const mileage = parseDutchInteger(mileageDisplay);
     const parsedFeatures = parseListingFeatures(features);
+    const listingKey = extractListingNumericId(cardId);
+    const metadata = listingKey ? structuredMetadata.get(listingKey) : undefined;
+    const gaspedaalUrl = metadata?.gaspedaalUrl ?? buildGaspedaalListingUrl(currentSearchUrl, cardId);
+    const sellerUrl = metadata?.sellerUrl ?? null;
 
     listings.push({
-      listingId: await card.getAttribute("id"),
+      listingId: cardId,
       title,
       priceDisplay,
       priceEur: parseDutchInteger(priceDisplay),
@@ -1020,16 +1045,172 @@ async function extractListings(page: Page): Promise<GaspedaalListing[]> {
       color: parsedFeatures.color,
       doors: parsedFeatures.doors,
       seller,
+      sellerUrl,
       location,
       sources,
+      sourceUrls: [],
       sourceSites: sources,
       features,
       imageUrl: imageUrl ? toAbsoluteUrl(imageUrl) : null,
-      href: href ? toAbsoluteUrl(href) : null
+      gaspedaalUrl,
+      href: href ? toAbsoluteUrl(href) : gaspedaalUrl
     });
   }
 
   return listings;
+}
+
+async function enrichListingsWithSourceUrls(page: Page, listings: GaspedaalListing[], actionDelayMs: number): Promise<void> {
+  const cards = page.locator('[data-testid="occasion-item"]');
+  const cardCount = await cards.count();
+  const listingById = new Map(listings.map((listing) => [listing.listingId, listing] as const));
+
+  for (let index = 0; index < cardCount; index += 1) {
+    const card = cards.nth(index);
+    const cardId = await card.getAttribute("id");
+
+    if (!cardId) {
+      continue;
+    }
+
+    const listing = listingById.get(cardId);
+
+    if (!listing) {
+      continue;
+    }
+
+    const sourceUrls = await openListingDialogAndExtractSourceUrls(page, card, actionDelayMs);
+
+    if (sourceUrls.length > 0) {
+      listing.sourceUrls = sourceUrls;
+    }
+  }
+}
+
+async function openListingDialogAndExtractSourceUrls(page: Page, card: Locator, actionDelayMs: number): Promise<string[]> {
+  try {
+    await dismissBlockingUi(page);
+    await card.scrollIntoViewIfNeeded();
+    await card.click({ timeout: 5_000 });
+    await pauseBetweenActions(page, actionDelayMs);
+
+    const dialog = await findVisibleLocator(
+      [
+        page.locator('dialog[open]'),
+        page.locator('[role="dialog"]')
+      ],
+      5_000
+    );
+
+    if (!dialog) {
+      return [];
+    }
+
+    const urls = dedupeStrings(
+      (await getAttributeList(dialog.locator('a[href]'), "href"))
+        .map((value: string | null) => (value ? toAbsoluteUrl(value) : null))
+        .filter((value: string | null): value is string => Boolean(value))
+    ).filter((value) => /^https?:/i.test(value));
+
+    await closeListingDialog(page, dialog, actionDelayMs);
+    return urls;
+  } catch {
+    return [];
+  }
+}
+
+async function closeListingDialog(page: Page, dialog: Locator, actionDelayMs: number): Promise<void> {
+  await clickFirstVisible(
+    [
+      dialog.getByRole("button", { name: /sluiten|close/i }),
+      dialog.locator('[data-testid="close-pop-up"]'),
+      dialog.locator("button").filter({ has: dialog.locator('svg use[href*="close"]') })
+    ],
+    1_500
+  );
+
+  await dialog.waitFor({ state: "hidden", timeout: 2_000 }).catch(async () => {
+    await page.keyboard.press("Escape").catch(() => undefined);
+    await dialog.waitFor({ state: "hidden", timeout: 2_000 }).catch(() => undefined);
+  });
+
+  await pauseBetweenActions(page, actionDelayMs);
+}
+
+async function extractStructuredListingMetadata(page: Page): Promise<Map<string, ListingStructuredMetadata>> {
+  const metadata = new Map<string, ListingStructuredMetadata>();
+  const scripts = await page.locator('script[type="application/ld+json"]').allTextContents().catch(() => []);
+
+  for (const scriptText of scripts) {
+    const parsedJson = tryParseJson(scriptText);
+
+    if (!parsedJson) {
+      continue;
+    }
+
+    for (const entry of flattenJsonLdNodes(parsedJson)) {
+      const item = isRecord(entry.item) ? entry.item : entry;
+      const rawId = typeof item["@id"] === "string" ? item["@id"] : null;
+      const key = extractListingNumericId(rawId);
+
+      if (!key) {
+        continue;
+      }
+
+      const seller = isRecord(item.offers) && isRecord(item.offers.seller) ? item.offers.seller : null;
+      const sellerUrl = seller && typeof seller.url === "string" ? toAbsoluteUrl(seller.url) : null;
+      const gaspedaalUrl = rawId ? toAbsoluteUrl(rawId) : null;
+
+      metadata.set(key, { gaspedaalUrl, sellerUrl });
+    }
+  }
+
+  return metadata;
+}
+
+function flattenJsonLdNodes(value: unknown): Array<Record<string, unknown>> {
+  if (Array.isArray(value)) {
+    return value.flatMap((entry: unknown) => flattenJsonLdNodes(entry));
+  }
+
+  if (!isRecord(value)) {
+    return [];
+  }
+
+  const nodes: Array<Record<string, unknown>> = [value];
+
+  if (Array.isArray(value["@graph"])) {
+    nodes.push(...value["@graph"].flatMap((entry: unknown) => flattenJsonLdNodes(entry)));
+  }
+
+  if (Array.isArray(value.itemListElement)) {
+    nodes.push(...value.itemListElement.flatMap((entry: unknown) => flattenJsonLdNodes(entry)));
+  }
+
+  return nodes;
+}
+
+function extractListingNumericId(value: string | null): string | null {
+  if (!value) {
+    return null;
+  }
+
+  const match = value.match(/(\d{6,})/);
+  return match?.[1] ?? null;
+}
+
+function buildGaspedaalListingUrl(searchUrl: string, listingId: string | null): string | null {
+  const numericId = extractListingNumericId(listingId);
+
+  if (!numericId) {
+    return null;
+  }
+
+  return `${stripHashFromUrl(searchUrl)}#o${numericId}`;
+}
+
+function stripHashFromUrl(url: string): string {
+  return url.replace(/#.*/, "");
 }
 
 async function findVisibleLocator(candidates: Locator[], timeoutMs: number): Promise<Locator | null> {
@@ -1359,6 +1540,17 @@ async function getAttribute(locator: Locator, name: string): Promise<string | nu
   return locator.getAttribute(name);
 }
 
+async function getAttributeList(locator: Locator, name: string): Promise<Array<string | null>> {
+  const count = await locator.count();
+  const values: Array<string | null> = [];
+
+  for (let index = 0; index < count; index += 1) {
+    values.push(await locator.nth(index).getAttribute(name));
+  }
+
+  return values;
+}
+
 async function getTextList(locator: Locator): Promise<string[]> {
   const count = await locator.count();
   const values: string[] = [];
@@ -1380,6 +1572,18 @@ function toErrorMessage(error: unknown): string {
   }
 
   return String(error);
+}
+
+function tryParseJson(value: string): unknown | null {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 async function waitForCookiePopupToDisappear(page: Page): Promise<void> {

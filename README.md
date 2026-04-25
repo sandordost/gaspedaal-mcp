@@ -382,6 +382,7 @@ De tool ondersteunt op dit moment:
 - `radius`
 - `powerMin`
 - `powerMax`
+- `includeSourceUrls`
 
 Extra regels:
 
@@ -471,7 +472,15 @@ Per listing zitten onder andere deze velden in de dataset:
 - `doors`
 - `location`
 - `imageUrl`
+- `gaspedaalUrl`
+- `sellerUrl`
 - `sources`
+- `sourceUrls`
+
+Opmerking:
+
+- `gaspedaalUrl` en `sellerUrl` worden standaard zonder extra klikken afgeleid uit de resultatenpagina
+- `sourceUrls` zijn de echte bronlinks uit het Gaspedaal dialoog en worden alleen verzameld als je `includeSourceUrls: true` meegeeft; dat maakt de zoekrun merkbaar zwaarder
 
 ### 6. Snelheid en vertraging
 

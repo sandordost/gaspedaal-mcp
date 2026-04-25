@@ -34,7 +34,11 @@ function buildServer(): McpServer {
         postcode: z.string().min(1).optional().describe('Nederlandse postcode voor afstandsfilter, bijvoorbeeld "3511AB".'),
         radius: filterValueSchema.optional().describe('Straal rond postcode, bijvoorbeeld 25 of "25 km".'),
         powerMin: filterValueSchema.optional().describe('Minimum vermogen in kW of pk, bijvoorbeeld 110 of "150 kW".'),
-        powerMax: filterValueSchema.optional().describe('Maximum vermogen in kW of pk, bijvoorbeeld 200 of "272 pk".')
+        powerMax: filterValueSchema.optional().describe('Maximum vermogen in kW of pk, bijvoorbeeld 200 of "272 pk".'),
+        includeSourceUrls: z
+          .boolean()
+          .optional()
+          .describe("Voer extra UI-stappen uit om per listing de echte bron-URL's uit het Gaspedaal dialoog te verzamelen.")
       }
     },
     async ({
@@ -52,7 +56,8 @@ function buildServer(): McpServer {
       postcode,
       radius,
       powerMin,
-      powerMax
+      powerMax,
+      includeSourceUrls
     }) => {
       const result = await searchExecutor.search({
         query: query ?? undefined,
@@ -69,7 +74,8 @@ function buildServer(): McpServer {
         postcode: postcode ?? undefined,
         radius: radius ?? undefined,
         powerMin: powerMin ?? undefined,
-        powerMax: powerMax ?? undefined
+        powerMax: powerMax ?? undefined,
+        includeSourceUrls: includeSourceUrls ?? undefined
       });
 
       return {
